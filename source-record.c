@@ -524,12 +524,16 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
-		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
-			signal_handler_connect(sh, "stop", remove_filter, filter);
-		}
 	} else {
 		obs_output_update(filter->fileOutput, s);
+	}
+	if (filter->remove_after_record) {
+		// (Re)connect on both the create and reuse paths: an internal restart stops the output
+		// via stop_output_sync, which disconnects this handler, and the output object is then
+		// reused here. Disconnect first so the handler is never registered twice.
+		signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
+		signal_handler_disconnect(sh, "stop", remove_filter, filter);
+		signal_handler_connect(sh, "stop", remove_filter, filter);
 	}
 	obs_data_release(s);
 	if (filter->encoder) {
@@ -654,14 +658,18 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 		}
 
 		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
-		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
-			signal_handler_connect(sh, "stop", remove_filter, filter);
-		}
 		dstr_free(&name);
 		obs_data_release(hotkeys);
 	} else {
 		obs_output_update(filter->replayOutput, s);
+	}
+	if (filter->remove_after_record) {
+		// (Re)connect on both the create and reuse paths: an internal restart stops the output
+		// via stop_output_sync, which disconnects this handler, and the output object is then
+		// reused here. Disconnect first so the handler is never registered twice.
+		signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
+		signal_handler_disconnect(sh, "stop", remove_filter, filter);
+		signal_handler_connect(sh, "stop", remove_filter, filter);
 	}
 	obs_data_release(s);
 	if (filter->encoder) {
@@ -1431,55 +1439,80 @@ static void source_record_filter_tick(void *data, float seconds)
 			context->width = width;
 			context->height = height;
 		}
-	} else if (width && height && (context->width != width || context->height != height)) {
-		// The parent source changed size while a pipeline already exists. Debounce before
-		// rebuilding so a source whose reported size oscillates does not trigger a per-frame
-		// view teardown storm.
-		if (context->pending_width != width || context->pending_height != height) {
-			context->pending_width = width;
-			context->pending_height = height;
-			context->resize_stable_ticks = 0;
-		} else if (context->resize_stable_ticks < RESIZE_STABLE_TICKS) {
-			context->resize_stable_ticks++;
-		}
-		if (context->resize_stable_ticks >= RESIZE_STABLE_TICKS) {
-			// Size has settled. Stop any active outputs first (synchronously), then defer
-			// the view swap until the encoders are idle so the old video_t is never freed
-			// while an encoder still references it (obs_view_remove schedules the old mix's
-			// video_t to be freed on the next graphics pass).
-			if (context->output_active) {
-				stop_outputs_sync(context);
-				context->output_active = false;
-				context->resize_pending = true;
-				obs_source_dec_showing(parent);
-			}
-			bool encoders_idle = !context->encoder || !obs_encoder_active(context->encoder);
-			for (int i = 0; encoders_idle && i < MAX_AUDIO_MIXES; i++) {
-				if (context->audioEncoder[i] && obs_encoder_active(context->audioEncoder[i]))
-					encoders_idle = false;
-			}
-			if (encoders_idle) {
-				struct obs_video_info ovi = {0};
-				obs_get_video_info(&ovi);
-
-				ovi.base_width = width;
-				ovi.base_height = height;
-				ovi.output_width = width;
-				ovi.output_height = height;
-
-				if (!context->view)
-					context->view = obs_view_create();
-
-				obs_view_remove(context->view);
-				context->video_output = obs_view_add2(context->view, &ovi);
-				if (context->video_output) {
-					context->width = width;
-					context->height = height;
+	} else if (width && height) {
+		// A pipeline already exists. Detect a settled size change and, when a rebuild is
+		// pending, complete it. The detect and complete steps are kept separate so a pending
+		// rebuild is always finished or cleared regardless of what size the source currently
+		// reports -- otherwise a source that returns to its original size mid-rebuild (common
+		// while a browser/window capture is dragged) would leave resize_pending set forever,
+		// and the start branch below (which requires !resize_pending) would never restart.
+		if (!context->resize_pending) {
+			if (context->width != width || context->height != height) {
+				// Debounce so a source whose reported size oscillates does not trigger a
+				// per-frame view teardown storm.
+				if (context->pending_width != width || context->pending_height != height) {
+					context->pending_width = width;
+					context->pending_height = height;
+					context->resize_stable_ticks = 0;
+				} else if (context->resize_stable_ticks < RESIZE_STABLE_TICKS) {
+					context->resize_stable_ticks++;
 				}
+				if (context->resize_stable_ticks >= RESIZE_STABLE_TICKS) {
+					// Size has settled at a new value. Stop active outputs (synchronously)
+					// and mark the rebuild pending; the view swap is deferred below until the
+					// encoders are idle so the old video_t is never freed while an encoder
+					// still references it.
+					if (context->output_active) {
+						stop_outputs_sync(context);
+						context->output_active = false;
+						obs_source_dec_showing(parent);
+					}
+					context->resize_pending = true;
+				}
+			} else {
+				// Back to the current view size before committing; cancel the debounce.
 				context->pending_width = 0;
 				context->pending_height = 0;
 				context->resize_stable_ticks = 0;
+			}
+		}
+		if (context->resize_pending) {
+			if (context->width == width && context->height == height) {
+				// The source returned to the size the view already uses before we rebuilt;
+				// no swap is needed. Clear the pending state so the outputs restart below.
 				context->resize_pending = false;
+				context->resize_stable_ticks = 0;
+				context->pending_width = 0;
+				context->pending_height = 0;
+			} else {
+				bool encoders_idle = !context->encoder || !obs_encoder_active(context->encoder);
+				for (int i = 0; encoders_idle && i < MAX_AUDIO_MIXES; i++) {
+					if (context->audioEncoder[i] && obs_encoder_active(context->audioEncoder[i]))
+						encoders_idle = false;
+				}
+				if (encoders_idle) {
+					struct obs_video_info ovi = {0};
+					obs_get_video_info(&ovi);
+
+					ovi.base_width = width;
+					ovi.base_height = height;
+					ovi.output_width = width;
+					ovi.output_height = height;
+
+					if (!context->view)
+						context->view = obs_view_create();
+
+					obs_view_remove(context->view);
+					context->video_output = obs_view_add2(context->view, &ovi);
+					if (context->video_output) {
+						context->width = width;
+						context->height = height;
+					}
+					context->resize_pending = false;
+					context->resize_stable_ticks = 0;
+					context->pending_width = 0;
+					context->pending_height = 0;
+				}
 			}
 		}
 	}
