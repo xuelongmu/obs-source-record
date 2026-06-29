@@ -38,7 +38,6 @@ struct source_record_filter_context {
 	int resize_stable_ticks;
 	bool resize_pending;
 	bool was_active;
-	volatile long pending_stops;
 	uint64_t last_frame_time_ns;
 	obs_view_t *view;
 	bool starting_file_output;
@@ -304,60 +303,6 @@ static void release_encoders(void *param)
 	}
 }
 
-struct stop_output {
-	struct source_record_filter_context *context;
-	obs_output_t *output;
-};
-
-void release_output_stopped(void *data, calldata_t *cd)
-{
-	UNUSED_PARAMETER(cd);
-	struct stop_output *so = data;
-	struct source_record_filter_context *context = so->context;
-	// Release the output asynchronously (it must not be destroyed from inside its own "stop"
-	// signal). obs_output_release does not touch the context, so it is safe to outlive it.
-	if (!context->exiting)
-		run_queued((obs_task_t)obs_output_release, so->output);
-	// release_encoders only touches the context and is run synchronously here so that the
-	// pending-stop decrement below is the LAST access to the context: once it reaches zero,
-	// destroy is free to bfree the context.
-	release_encoders(context);
-	os_atomic_dec_long(&context->pending_stops);
-	bfree(data);
-}
-
-static void force_stop_output_task(void *data)
-{
-	struct stop_output *so = data;
-	signal_handler_t *sh = obs_output_get_signal_handler(so->output);
-	if (sh && obs_output_active(so->output)) {
-		signal_handler_connect(sh, "stop", release_output_stopped, data);
-		obs_output_force_stop(so->output);
-	} else {
-		// No "stop" signal will fire (no handler, or the output is already inactive):
-		// release inline and clear the pending-stop counter here.
-		if (!so->context->exiting)
-			obs_output_release(so->output);
-		release_encoders(so->context);
-		os_atomic_dec_long(&so->context->pending_stops);
-		bfree(data);
-	}
-}
-
-// Queues an asynchronous force-stop + release of an output, tracking it in the context's
-// pending-stop counter so destroy can wait for the task (and its "stop" callback) to finish
-// touching the context before the context is freed. Used by the non-closing update paths.
-static void queue_force_stop(struct source_record_filter_context *context, obs_output_t *output)
-{
-	if (!output)
-		return;
-	struct stop_output *so = bmalloc(sizeof(struct stop_output));
-	so->output = output;
-	so->context = context;
-	os_atomic_inc_long(&context->pending_stops);
-	run_queued(force_stop_output_task, so);
-}
-
 static void start_replay_task(void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -391,15 +336,29 @@ static void ensure_directory(char *path)
 #endif
 }
 
+// Carries the deferred filter removal. It holds an extra strong reference to the filter
+// source so the filter context (freed inside the filter source's destroy) cannot be freed
+// before the queued task runs -- even if a scene-collection cleanup or parent removal races.
+struct remove_filter_call {
+	struct source_record_filter_context *context;
+	obs_source_t *source;
+};
+
 static void remove_filter_task(void *data)
 {
-	struct source_record_filter_context *filter = data;
-	obs_source_t *source = obs_filter_get_parent(filter->source);
-	if (!source && filter->view) {
-		source = obs_view_get_source(filter->view, SOURCE_CHANNEL);
-		obs_source_release(source);
+	struct remove_filter_call *call = data;
+	struct source_record_filter_context *context = call->context;
+	obs_source_t *self = call->source; // our extra strong ref keeps the context alive
+	obs_source_t *parent = obs_filter_get_parent(self);
+	if (!parent && context->view) {
+		parent = obs_view_get_source(context->view, SOURCE_CHANNEL);
+		obs_source_release(parent);
 	}
-	obs_source_filter_remove(source, filter->source);
+	// Safe with our extra ref held: removal unlinks the filter and drops only the parent's
+	// owning ref; the final destroy is deferred until we release our ref below.
+	obs_source_filter_remove(parent, self);
+	obs_source_release(self); // may trigger the deferred destroy that frees context
+	bfree(call);
 }
 
 static void stop_output_sync(struct source_record_filter_context *context, obs_output_t *output)
@@ -407,8 +366,10 @@ static void stop_output_sync(struct source_record_filter_context *context, obs_o
 	UNUSED_PARAMETER(context);
 	if (!output)
 		return;
-	if (obs_output_active(output))
-		obs_output_force_stop(output);
+	// Force-stop unconditionally rather than gating on obs_output_active(): a stream/HLS
+	// output that is still connecting reports active==false yet has live connection work that
+	// must be aborted. force-stop is a safe no-op on a truly-inactive output.
+	obs_output_force_stop(output);
 }
 
 // Force-stops all of this filter's outputs synchronously, keeping the output objects owned
@@ -915,12 +876,9 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_file_output(filter, settings);
 		} else if (filter->fileOutput) {
-			if (filter->closing) {
-				stop_output_sync(filter, filter->fileOutput);
-			} else {
-				queue_force_stop(filter, filter->fileOutput);
-				filter->fileOutput = NULL;
-			}
+			// Stop synchronously and keep the output owned by the context (released in
+			// destroy, reused on the next start). No async task holds a raw context pointer.
+			stop_output_sync(filter, filter->fileOutput);
 		}
 		filter->record = record;
 	}
@@ -943,12 +901,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
 			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
 			obs_data_release(hotkeys);
-			if (filter->closing) {
-				stop_output_sync(filter, filter->replayOutput);
-			} else {
-				queue_force_stop(filter, filter->replayOutput);
-				filter->replayOutput = NULL;
-			}
+			stop_output_sync(filter, filter->replayOutput);
 		}
 
 		filter->replayBuffer = replay_buffer;
@@ -957,8 +910,9 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
 			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
 			obs_data_release(hotkeys);
-			queue_force_stop(filter, filter->replayOutput);
-			filter->replayOutput = NULL;
+			// Stop synchronously and restart to apply the new duration; the output object is
+			// reused via obs_output_update and obs_output_start self-serializes on the stop.
+			stop_output_sync(filter, filter->replayOutput);
 			start_replay_output(filter, settings);
 		}
 		obs_data_t *replay_settings = obs_output_get_settings(filter->replayOutput);
@@ -997,12 +951,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_stream_output(filter, settings);
 		} else if (filter->streamOutput) {
-			if (filter->closing) {
-				stop_output_sync(filter, filter->streamOutput);
-			} else {
-				queue_force_stop(filter, filter->streamOutput);
-				filter->streamOutput = NULL;
-			}
+			stop_output_sync(filter, filter->streamOutput);
 		}
 		filter->stream = stream;
 	}
@@ -1186,15 +1135,13 @@ static void source_record_filter_destroy(void *data)
 	if (context->chapterHotkey != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(context->chapterHotkey);
 
-	// Wait for the encoders to go inactive AND for every queued force_stop_output_task (and
-	// its asynchronous "stop" callback) to finish touching this context. queue_force_stop
-	// increments pending_stops and release_output_stopped decrements it as its last context
-	// access, so reaching zero means no abandoned task can still dereference the context.
-	// This works during shutdown too: the wait runs on the destruction thread and does not
-	// depend on the graphics/UI task queues (which may already be stopped on exit).
+	// Outputs were force-stopped synchronously above; wait for the encoders to finish
+	// deactivating (the output's end_data_capture clears encoder-active asynchronously)
+	// before releasing them. All stops are synchronous and outputs stay owned by the context,
+	// so there are no abandoned async tasks holding a raw context pointer to wait on.
 	for (int retries = 0; retries < 300; retries++) {
-		bool any_active = os_atomic_load_long(&context->pending_stops) > 0;
-		if (!any_active && context->encoder && obs_encoder_active(context->encoder))
+		bool any_active = false;
+		if (context->encoder && obs_encoder_active(context->encoder))
 			any_active = true;
 		for (int i = 0; i < MAX_AUDIO_MIXES && !any_active; i++) {
 			if (context->audioEncoder[i] &&
@@ -1540,14 +1487,39 @@ static void source_record_filter_tick(void *data, float seconds)
 		obs_source_dec_showing(parent);
 	}
 
+	// Release the per-source encoders once the filter is no longer recording so a hardware
+	// (e.g. NVENC) encode session is not held while idle. release_encoders early-returns while
+	// the source is enabled and still recording, and only releases encoders once they go inactive.
+	release_encoders(context);
+
+	// A remove_after_record filter (created via the websocket API) that has recorded should be
+	// removed once it is no longer running. This is driven by filter state rather than the output
+	// "stop" signal so removal still happens when an internal restart/resize stopped the output
+	// with no live handler left to fire it. Two cases satisfy "no longer running":
+	//   1. The outputs were turned off via settings (record_mode/stream_mode/replay_buffer cleared),
+	//      so record/stream/replayBuffer are all false.
+	//   2. The filter was disabled (obs_source_set_enabled(false)). Disabling does NOT recompute
+	//      record/stream/replayBuffer (those only change in source_record_filter_update), so the
+	//      disable branch above leaves them set even though it already force-stopped and released the
+	//      outputs (output_active == false). Without this case a disabled remove_after_record filter
+	//      would stay attached forever -- regressing the old behavior, where the disable-triggered
+	//      output "stop" fired the now-removed remove_filter handler. was_active gates both cases so a
+	//      freshly-created filter that has not recorded yet is never removed; remove_after_record gates
+	//      so ordinary (user-created) filters are never removed.
+	const bool outputs_off = !context->record && !context->stream && !context->replayBuffer;
+	const bool disabled_after_active = !context->output_active && !obs_source_enabled(context->source);
 	if (context->remove_after_record && context->was_active && !context->resize_pending && !context->restart &&
-	    !context->record && !context->stream && !context->replayBuffer) {
-		// A remove_after_record filter (created via the websocket API) that has recorded and is
-		// now fully stopped and not mid restart/resize: remove it. Driven by filter state rather
-		// than the output "stop" signal so removal still happens when an internal restart/resize
-		// stopped the output with no live handler left to fire it.
-		context->was_active = false;
-		run_queued(remove_filter_task, context);
+	    (outputs_off || disabled_after_active)) {
+		// Pin the filter source with a strong ref so the context cannot be freed by a racing
+		// destroy (scene-collection cleanup / parent removal) before the queued task runs.
+		obs_source_t *self = obs_source_get_ref(context->source);
+		if (self) {
+			struct remove_filter_call *call = bzalloc(sizeof(struct remove_filter_call));
+			call->context = context;
+			call->source = self;
+			context->was_active = false;
+			run_queued(remove_filter_task, call);
+		}
 		return;
 	}
 
