@@ -265,7 +265,10 @@ static const char *GetFormatExt(const char *format)
 static void start_file_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->fileOutput)) {
+	// Recording may have been turned off (or the filter disabled/closed) after this start was
+	// queued but before it ran; don't start an output that is no longer wanted.
+	if (context->record && !context->closing && obs_source_enabled(context->source) &&
+	    obs_output_start(context->fileOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
@@ -277,7 +280,8 @@ static void start_file_output_task(void *data)
 static void start_stream_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->streamOutput)) {
+	if (context->stream && !context->closing && obs_source_enabled(context->source) &&
+	    obs_output_start(context->streamOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
@@ -306,7 +310,8 @@ static void release_encoders(void *param)
 static void start_replay_task(void *data)
 {
 	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->replayOutput)) {
+	if (context->replayBuffer && !context->closing && obs_source_enabled(context->source) &&
+	    obs_output_start(context->replayOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
@@ -349,14 +354,21 @@ static void remove_filter_task(void *data)
 	struct remove_filter_call *call = data;
 	struct source_record_filter_context *context = call->context;
 	obs_source_t *self = call->source; // our extra strong ref keeps the context alive
-	obs_source_t *parent = obs_filter_get_parent(self);
-	if (!parent && context->view) {
-		parent = obs_view_get_source(context->view, SOURCE_CHANNEL);
-		obs_source_release(parent);
+	// Re-check: a client may have restarted or re-enabled this same auto-created filter (via
+	// get_source_record_filter) between scheduling and now. If it is recording again or no
+	// longer meets the removal condition, cancel -- otherwise we would remove a live filter.
+	const bool outputs_off = !context->record && !context->stream && !context->replayBuffer;
+	const bool disabled = !context->output_active && !obs_source_enabled(self);
+	if (context->remove_after_record && !context->resize_pending && !context->restart && (outputs_off || disabled)) {
+		obs_source_t *parent = obs_filter_get_parent(self);
+		if (!parent && context->view) {
+			parent = obs_view_get_source(context->view, SOURCE_CHANNEL);
+			obs_source_release(parent);
+		}
+		// Safe with our extra ref held: removal unlinks the filter and drops only the parent's
+		// owning ref; the final destroy is deferred until we release our ref below.
+		obs_source_filter_remove(parent, self);
 	}
-	// Safe with our extra ref held: removal unlinks the filter and drops only the parent's
-	// owning ref; the final destroy is deferred until we release our ref below.
-	obs_source_filter_remove(parent, self);
 	obs_source_release(self); // may trigger the deferred destroy that frees context
 	bfree(call);
 }
@@ -2040,10 +2052,15 @@ static bool pause_record_source(obs_source_t *source, obs_data_t *request_data, 
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	// Hold the request's reference until after the output is used: a queued auto-removal or
+	// scene-collection cleanup could otherwise unlink the filter and free the context between
+	// the release and the dereference below.
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, true);
+	obs_source_release(filter);
 	return true;
 }
 
@@ -2054,10 +2071,12 @@ static bool unpause_record_source(obs_source_t *source, obs_data_t *request_data
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, false);
+	obs_source_release(filter);
 	return true;
 }
 
@@ -2068,18 +2087,17 @@ static bool split_record_source(obs_source_t *source, obs_data_t *request_data, 
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
-	if (!proc_handler_call(ph, "split_file", &cd)) {
-		calldata_free(&cd);
-		return false;
-	}
+	bool success = proc_handler_call(ph, "split_file", &cd);
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return success;
 }
 
 static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
@@ -2089,19 +2107,18 @@ static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
 	calldata_set_string(&cd, "chapter_name", obs_data_get_string(request_data, "chapter_name"));
-	if (!proc_handler_call(ph, "add_chapter", &cd)) {
-		calldata_free(&cd);
-		return false;
-	}
+	bool success = proc_handler_call(ph, "add_chapter", &cd);
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return success;
 }
 
 static bool stop_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
@@ -2356,17 +2373,20 @@ static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	if (!filter)
 		return false;
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	// Release the reference returned by get_source_record_filter up front so the early
-	// return below cannot leak it (matching pause/unpause/split/add_chapter). The filter
-	// stays alive because it remains owned by the source graph for the duration of this call.
-	obs_source_release(filter);
-	if (!context->replayOutput)
+	// Hold the request's reference until after the replay output is used, releasing on every
+	// exit. Releasing up front would let a queued auto-removal or scene-collection cleanup
+	// unlink the filter and free the context before the dereference below (use-after-free);
+	// releasing only at the end would leak on the early return.
+	if (!context->replayOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 
 	proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
 	calldata_t cd = {0};
 	bool success = proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
+	obs_source_release(filter);
 	return success;
 }
 
