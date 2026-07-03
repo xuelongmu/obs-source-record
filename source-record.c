@@ -1384,7 +1384,14 @@ static void source_record_filter_tick(void *data, float seconds)
 	width += (width & 1);
 	uint32_t height = obs_source_get_height(parent);
 	height += (height & 1);
-	if (width && height && !context->video_output) {
+
+	// Whether any output wants the capture pipeline. The view/video mix is created lazily on
+	// this condition and torn down below when it goes false, so an attached-but-idle filter
+	// (mode None, or disabled) does not cost a full extra composite render every frame.
+	const bool want_outputs =
+		obs_source_enabled(context->source) && (context->record || context->stream || context->replayBuffer);
+
+	if (width && height && !context->video_output && want_outputs) {
 		// First-time pipeline creation; there is no active output to disrupt.
 		struct obs_video_info ovi = {0};
 		obs_get_video_info(&ovi);
@@ -1402,7 +1409,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			context->width = width;
 			context->height = height;
 		}
-	} else if (width && height) {
+	} else if (width && height && context->video_output) {
 		// A pipeline already exists. Detect a settled size change and, when a rebuild is
 		// pending, complete it. The detect and complete steps are kept separate so a pending
 		// rebuild is always finished or cleared regardless of what size the source currently
@@ -1550,6 +1557,33 @@ static void source_record_filter_tick(void *data, float seconds)
 	// (e.g. NVENC) encode session is not held while idle. release_encoders early-returns while
 	// the source is enabled and still recording, and only releases encoders once they go inactive.
 	release_encoders(context);
+
+	// Tear the private view/video mix down once nothing wants it and everything has gone
+	// idle, so the filter stops costing a composite render per frame. It is recreated by the
+	// creation branch above on the first tick an output is wanted again. Clearing the view
+	// channels also drops the view's reference to the parent source while idle.
+	if (context->video_output && !want_outputs && !context->output_active && !context->resize_pending &&
+	    !context->starting_file_output && !context->starting_stream_output && !context->starting_replay_output) {
+		bool busy = (context->fileOutput && obs_output_active(context->fileOutput)) ||
+			    (context->streamOutput && obs_output_active(context->streamOutput)) ||
+			    (context->replayOutput && obs_output_active(context->replayOutput)) ||
+			    (context->encoder && obs_encoder_active(context->encoder));
+		for (int i = 0; !busy && i < MAX_AUDIO_MIXES; i++) {
+			if (context->audioEncoder[i] && obs_encoder_active(context->audioEncoder[i]))
+				busy = true;
+		}
+		if (!busy) {
+			obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
+			obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
+			obs_view_remove(context->view);
+			context->video_output = NULL;
+			context->width = 0;
+			context->height = 0;
+			context->pending_width = 0;
+			context->pending_height = 0;
+			context->resize_stable_ticks = 0;
+		}
+	}
 
 	// A remove_after_record filter (created via the websocket API) that has recorded should be
 	// removed once it is no longer running. This is driven by filter state rather than the output
