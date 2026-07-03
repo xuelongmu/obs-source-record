@@ -63,9 +63,14 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Build only the plugin and its dependency closure (w32-pthreads, libobs,
+      # obs-frontend-api -- verified to link libobs only). This skips the Qt
+      # frontend and OBS's bundled plugins, notably the ATL-dependent ones
+      # (captions/sphelper, obs-qsv11, the virtualcam module), which fail on
+      # runner images whose toolset lacks matching ATL headers.
       - name: Build
         shell: pwsh
-        run: cmake --build build_x64 --config RelWithDebInfo --parallel
+        run: cmake --build build_x64 --config RelWithDebInfo --parallel --target source-record
 
       - name: Package
         shell: pwsh
