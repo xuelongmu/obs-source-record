@@ -14,7 +14,10 @@ env:
 jobs:
   windows-x64:
     name: Windows x64 (in-tree)
-    runs-on: windows-latest
+    # OBS 32.1.x pins the "Visual Studio 17 2022" generator; windows-latest
+    # (2025+) images no longer carry VS 2022, so use the same runner OBS's own
+    # CI used at this tag.
+    runs-on: windows-2022
     steps:
       - name: Checkout obs-studio
         uses: actions/checkout@v4
