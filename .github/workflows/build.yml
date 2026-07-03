@@ -55,8 +55,11 @@ jobs:
           if ($vs2022) {
             cmake --preset windows-x64 -DENABLE_BROWSER=OFF
           } else {
-            Write-Output 'VS 2022 not found; using VS 2026 generator with the 14.44 toolset'
-            cmake --preset windows-x64 -G 'Visual Studio 18 2026' -A x64 -T version=14.44 -DENABLE_BROWSER=OFF
+            Write-Output 'VS 2022 not found; using VS 2026 generator with the v143 (VS2022) toolset'
+            # -T v143 selects the VS2022-era toolset the image installs via its
+            # VC.14.44 component. (A bare "version=" spec is invalid here: CMake
+            # combines it with the default v145 toolset and rejects the pair.)
+            cmake --preset windows-x64 -G 'Visual Studio 18 2026' -A x64 -T v143 -DENABLE_BROWSER=OFF
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
