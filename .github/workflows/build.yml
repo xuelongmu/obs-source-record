@@ -14,10 +14,11 @@ env:
 jobs:
   windows-x64:
     name: Windows x64 (in-tree)
-    # OBS 32.1.x pins the "Visual Studio 17 2022" generator; windows-latest
-    # (2025+) images no longer carry VS 2022, so use the same runner OBS's own
-    # CI used at this tag.
-    runs-on: windows-2022
+    # The windows-2022 image is retired -- its label now provisions windows-2025-vs2026
+    # (VS 2026 only), which cannot satisfy the "Visual Studio 17 2022" generator that the
+    # OBS 32.1.x preset pins. windows-latest (= windows-2025) still ships VS 2022 17.14;
+    # the Configure step below also has a VS 2026 fallback for when that migrates too.
+    runs-on: windows-latest
     steps:
       - name: Checkout obs-studio
         uses: actions/checkout@v4
@@ -40,9 +41,24 @@ jobs:
       # The windows-x64 preset downloads obs-deps (incl. Qt) automatically via
       # buildspec.json. Browser is disabled to skip the CEF download; the plugin
       # does not interact with it.
+      #
+      # The preset pins the "Visual Studio 17 2022" generator. If the runner image no
+      # longer carries VS 2022 (GitHub is migrating images to VS 2026), fall back to the
+      # VS 2026 generator with the VS2022-era 14.44 toolset, and drop the preset's SDK
+      # pin (-A x64) since those images ship a newer Windows SDK. CLI -G/-A/-T override
+      # preset values.
       - name: Configure
         shell: pwsh
-        run: cmake --preset windows-x64 -DENABLE_BROWSER=OFF
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs2022 = & $vswhere -products * -version '[17.0,18.0)' -property installationPath
+          if ($vs2022) {
+            cmake --preset windows-x64 -DENABLE_BROWSER=OFF
+          } else {
+            Write-Output 'VS 2022 not found; using VS 2026 generator with the 14.44 toolset'
+            cmake --preset windows-x64 -G 'Visual Studio 18 2026' -A x64 -T version=14.44 -DENABLE_BROWSER=OFF
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build
         shell: pwsh
